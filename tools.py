@@ -71,7 +71,18 @@ def _request(
     unattended run (plugin-catalog rule 12).
     """
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        # Required, not cosmetic: api.scribase.com sits behind Cloudflare, and a
+        # bare CPython urllib request (the literal "Python-urllib/3.x" default
+        # User-Agent, with no header set at all otherwise) is hard-blocked by
+        # Cloudflare's WAF with a 403 "browser_signature_banned" before it ever
+        # reaches the control plane — reproduced live against production while
+        # building the 2026-11-06 real-session demo. Any non-default string
+        # clears it; this one just also identifies the client honestly.
+        "User-Agent": "scribase-hermes-plugin/1.2.1 (+https://github.com/caelum0x/scribase-hermes-plugin)",
+    }
     if data is not None:
         headers["Content-Type"] = "application/json"
     if extra_headers:
@@ -199,12 +210,21 @@ def create_project(args: Dict[str, Any], *, api_key: str, api_base: str) -> Dict
         return {"error": "failed to create project", "status": status, "detail": body}
 
     # 2. Create its first environment — async; returns an operation to poll.
+    #    `ttl_hours` is omitted entirely rather than sent as a literal JSON
+    #    `null` — a production environment has no TTL, and the control
+    #    plane's request-schema validator rejects an explicit null for this
+    #    optional field with `400 invalid_json` ("request JSON does not
+    #    match the operation schema"), confirmed live against production
+    #    while building the 2026-11-06 real-session demo (A/B: omitting the
+    #    key succeeds — a real `409 conflict` on an already-provisioned
+    #    environment, or a real `202` on a genuinely new one; sending
+    #    `"ttl_hours": null` 400s every time).
     status, body = _request(
         "POST", f"{api_base}/v1/environments", api_key,
         body={
             "organization_id": org, "project_id": project, "environment_id": environment,
             "kind": "production", "data_mode": "schema_only",
-            "region": region, "postgres_major": postgres_major, "ttl_hours": None,
+            "region": region, "postgres_major": postgres_major,
         },
         extra_headers={"Idempotency-Key": _idempotency_key()},
     )

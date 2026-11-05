@@ -1,5 +1,5 @@
 name: scribase
-version: "1.2.0"
+version: "1.2.1"
 description: "Provision a hosted Postgres backend project on Scribase (api.scribase.com), lint a SQL migration for real safety issues (missing RLS, unsafe grants/policies) before running it, run read-only queries against the project's database, and give an agent a real copy-on-write Postgres branch to create, promote, or discard for one task."
 author: Scribase
 requires_hermes: ">=0.20.1"
