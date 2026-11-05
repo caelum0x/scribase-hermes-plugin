@@ -108,6 +108,114 @@ SCRIBASE_LINT_MIGRATION = {
 }
 
 
+SCRIBASE_BRANCH_TASK = {
+    "name": "scribase_branch_task",
+    "description": (
+        "Give an agent a throwaway, real copy-on-write Postgres branch for one "
+        "task — no generic prompt or skill can do this, because it requires "
+        "real infrastructure, not just careful instructions. action='create' "
+        "forks a brand-new environment from an existing one (default "
+        "'production') in seconds, so the agent can test a risky migration, "
+        "run exploratory queries, or try something destructive against real "
+        "data without any chance of touching the real database. When the task "
+        "is done, call this again with action='promote' to three-way merge "
+        "the branch's schema changes back into its parent (the control plane "
+        "refuses the merge if there are unresolved conflicts, unless "
+        "force=true — which itself is refused for an MFA-protected "
+        "organization, since a forced merge needs an interactive step-up this "
+        "tool cannot answer), or action='discard' to delete the branch outright "
+        "when the task failed or was just exploration. A branch always carries "
+        "a short TTL (default 4h, max 24h) and self-deletes even if nothing "
+        "ever calls discard. Requires an existing Scribase organization and "
+        "project, and an organization API key configured as SCRIBASE_API_KEY."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "promote", "discard"],
+                "description": (
+                    "'create' cuts a new branch. 'promote' merges an existing "
+                    "branch's schema back into its parent. 'discard' deletes "
+                    "an existing branch immediately instead of waiting for its "
+                    "TTL."
+                ),
+            },
+            "organization_id": {
+                "type": "string",
+                "description": "The Scribase organization the project belongs to.",
+            },
+            "project_id": {
+                "type": "string",
+                "description": "The existing Scribase project to branch within.",
+            },
+            "environment_id": {
+                "type": "string",
+                "description": (
+                    "For action='create': an optional name for the new branch "
+                    "(auto-generated like 'agent-ab12cd34' if omitted). For "
+                    "action='promote' or action='discard': required — the "
+                    "existing branch to act on."
+                ),
+            },
+            "base_environment_id": {
+                "type": "string",
+                "description": (
+                    "The parent environment. For action='create', the branch "
+                    "forks from this (default 'production'). For "
+                    "action='promote', the branch's schema is merged into this "
+                    "(default 'production'); it must be the same environment "
+                    "the branch was actually created from."
+                ),
+            },
+            "data_mode": {
+                "type": "string",
+                "enum": ["snapshot", "sanitized", "schema_only"],
+                "description": (
+                    "Only used by action='create'. 'snapshot' clones the "
+                    "parent's real data via copy-on-write (best for "
+                    "reproducing a real bug or testing a migration against "
+                    "real data). 'sanitized' clones it with sensitive columns "
+                    "and secrets scrubbed. 'schema_only' copies just the "
+                    "schema, no rows. Defaults to 'snapshot'."
+                ),
+            },
+            "ttl_hours": {
+                "type": "integer",
+                "description": (
+                    "Only used by action='create'. Hours until the branch "
+                    "auto-deletes itself even if nothing calls discard. Must "
+                    "be 1-24 (this keeps it in Scribase's dedicated "
+                    "agent-branch slot pool instead of the human preview "
+                    "pool). Defaults to 4."
+                ),
+            },
+            "force": {
+                "type": "boolean",
+                "description": (
+                    "Only used by action='promote'. If true, the branch's "
+                    "schema wins every conflict instead of the merge failing "
+                    "on the first one. Refused by the server with "
+                    "'mfa_required' for an organization that has multi-factor "
+                    "authentication enabled, since a forced merge needs an "
+                    "interactive step-up code. Defaults to false."
+                ),
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": (
+                    "Only used by action='promote'. If true, plans the merge "
+                    "and reports its changes/conflicts without applying "
+                    "anything. Defaults to false."
+                ),
+            },
+        },
+        "required": ["action", "organization_id", "project_id"],
+    },
+}
+
+
 SCRIBASE_QUERY = {
     "name": "scribase_query",
     "description": (

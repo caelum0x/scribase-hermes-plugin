@@ -1,6 +1,6 @@
 """Scribase plugin for Hermes Agent — registration.
 
-Registers three tools against Scribase's public REST API
+Registers four tools against Scribase's public REST API
 (https://api.scribase.com):
 
 - `scribase_create_project` — provisions a new hosted Postgres backend
@@ -13,6 +13,13 @@ Registers three tools against Scribase's public REST API
   project's database and returns the rows. The control plane enforces
   read-only itself (a static check, then a Postgres `READ ONLY`
   transaction), so this can never write or alter data.
+- `scribase_branch_task` — gives an agent a real, throwaway, copy-on-write
+  Postgres branch for one task: `create` forks one from an existing
+  environment with a bounded TTL, `promote` three-way merges its schema
+  back into the parent (the control plane itself refuses a conflicting
+  merge unless `force`, which it also refuses for an MFA-protected
+  organization), `discard` deletes it outright. The parent is never touched
+  except through that one explicit, server-validated merge.
 
 Hermes surfaces used: `ctx.register_tool` only. No hooks, no middleware, no
 CLI/slash commands, no runtime overrides of Hermes internals.
@@ -81,7 +88,7 @@ def _make_handler(
 
 
 def register(ctx) -> None:
-    """Wires all three Scribase tools to the Scribase REST client."""
+    """Wires all four Scribase tools to the Scribase REST client."""
 
     ctx.register_tool(
         name="scribase_create_project",
@@ -102,4 +109,11 @@ def register(ctx) -> None:
         toolset="scribase",
         schema=schemas.SCRIBASE_QUERY,
         handler=_make_handler(ctx, "scribase_query", tools.run_query),
+    )
+
+    ctx.register_tool(
+        name="scribase_branch_task",
+        toolset="scribase",
+        schema=schemas.SCRIBASE_BRANCH_TASK,
+        handler=_make_handler(ctx, "scribase_branch_task", tools.branch_task),
     )

@@ -1,15 +1,21 @@
 # Scribase plugin for Hermes Agent
 
-Lets a [Hermes Agent](https://github.com/NousResearch/hermes-agent) run a
-real hosted Postgres backend on [Scribase](https://scribase.com) — a
-Postgres-as-a-service with a Supabase-API-compatible REST/Auth/Storage/
-Realtime/Functions surface — without the user leaving the chat: provision a
-project, check a migration for real safety problems before it runs, and
-query the data, all against the live API.
+**Gives a [Hermes Agent](https://github.com/NousResearch/hermes-agent) a real hosted Postgres backend — provision a project, lint a migration before it runs, query the data, and spin up a disposable copy-on-write branch for one task — all against the live [Scribase](https://scribase.com) API, no human leaving the chat.**
+
+Scribase is Postgres-as-a-service with a Supabase-API-compatible REST/Auth/
+Storage/Realtime/Functions surface. This plugin is a thin, zero-dependency
+client (stdlib `urllib` only) that calls only `api.scribase.com`.
+
+▶️ **Demo video:** a 29s code-rendered terminal recreation of real captured
+output (validator run, real lint-engine findings, two live production
+`curl` calls) — see [`HACKATHON-SUBMISSION-2026-11-05.md`](./HACKATHON-SUBMISSION-2026-11-05.md)
+in this repo for the full, honest breakdown of what's real-captured vs. what
+a login-gated full agent loop couldn't show, and where the posted video will
+be linked from once it's live on X.
 
 ## What it does
 
-Registers three tools, no hooks, no middleware, no CLI/slash commands:
+Registers four tools, no hooks, no middleware, no CLI/slash commands:
 
 ### `scribase_create_project`
 
@@ -22,6 +28,21 @@ Registers three tools, no hooks, no middleware, no CLI/slash commands:
    (`anon_key`, `service_role_key`, `publishable_key`, `secret_key`,
    `api_url`).
 
+**Example call:**
+```json
+{"organization_id": "acme", "project_id": "store"}
+```
+**Example response:**
+```json
+{
+  "organization_id": "acme", "project_id": "store", "environment_id": "production",
+  "region": "eu-frankfurt", "status": "ready",
+  "api_url": "https://store.api.scribase.com", "anon_key": "sb_anon_...",
+  "publishable_key": "sb_publishable_...", "service_role_key": "sb_secret_...",
+  "secret_key": "sb_secret_...", "connection_uri": "postgresql://postgres:...@db.store.scribase.com:5432/postgres"
+}
+```
+
 ### `scribase_lint_migration`
 
 Submits a migration's `up` SQL to Scribase's real migration-safety linter —
@@ -33,8 +54,26 @@ policy with no `WITH CHECK`, and a `SECURITY DEFINER` function are all
 **block** findings; a foreign key with no supporting index is a **warn**
 finding. The request always sends `"apply": false` — hardcoded in this
 plugin, not read from the model's arguments — so this tool can never run
-the migration, only check it. Returns `{status, safe_to_apply,
-blocking_findings, warning_findings, plan}`.
+the migration, only check it.
+
+**Example call:**
+```json
+{
+  "organization_id": "acme", "project_id": "store", "environment_id": "production",
+  "up": "create table public.payments (id uuid primary key, amount numeric not null);"
+}
+```
+**Example response:**
+```json
+{
+  "status": "blocked", "safe_to_apply": false,
+  "blocking_findings": [
+    {"rule": "missing_rls", "severity": "BLOCK", "subject": "public.payments",
+     "line": 1, "message": "table has no row level security policy"}
+  ],
+  "warning_findings": [], "plan": {"steps": ["create table public.payments (...);"]}
+}
+```
 
 ### `scribase_query`
 
@@ -46,6 +85,78 @@ a static keyword check, then a Postgres `READ ONLY` transaction with a
 bounded statement timeout — so a write or DDL statement, or a
 data-modifying CTE, is rejected by the server itself, not by a check this
 plugin invented.
+
+**Example call:**
+```json
+{
+  "organization_id": "acme", "project_id": "store", "environment_id": "production",
+  "query": "select count(*) from public.payments", "limit": 10
+}
+```
+**Example response:**
+```json
+{
+  "kind": "rows", "row_count": 1, "returned": 1, "applied_limit": 10,
+  "truncated": false, "rows": [{"count": 1842}]
+}
+```
+
+### `scribase_branch_task`
+
+Gives an agent a real, throwaway, **copy-on-write** Postgres branch for one
+task — the kind of workflow a prompt or skill genuinely cannot do on its
+own, because it needs real infrastructure (an actual forked database, a
+real merge-base diff, a real teardown), not just careful instructions.
+One tool, three actions:
+
+- **`create`** — forks a new environment from an existing one (default
+  `production`) in seconds. Use it before a risky migration, an
+  exploratory query session, or anything you don't want touching the real
+  database. The branch always carries a bounded TTL (1-24h, default 4h) so
+  it self-deletes even if nothing ever calls `discard`, and lands in
+  Scribase's own agent-branch slot pool instead of competing with a human's
+  preview environments.
+- **`promote`** — three-way merges the branch's schema changes back into
+  its parent. The control plane itself refuses the merge if there are
+  unresolved conflicts, unless `force: true` — and it refuses *that* too on
+  an MFA-protected organization, since a forced merge needs an interactive
+  step-up code this tool has no way to answer. Either way the real server
+  decision comes back verbatim, not something this plugin invented.
+- **`discard`** — deletes the branch immediately instead of waiting for
+  its TTL. Permanent, matching the real endpoint's own contract.
+
+**Example call (create):**
+```json
+{
+  "action": "create", "organization_id": "acme", "project_id": "store",
+  "base_environment_id": "production", "ttl_hours": 2
+}
+```
+**Example response:**
+```json
+{
+  "organization_id": "acme", "project_id": "store", "environment_id": "agent-7f3a9c21",
+  "base_environment_id": "production", "data_mode": "snapshot", "ttl_hours": 2,
+  "region": "eu-frankfurt", "status": "ready",
+  "connection_uri": "postgresql://postgres:...@db.agent-7f3a9c21.scribase.com:5432/postgres",
+  "api_url": "...", "anon_key": "...", "service_role_key": "...",
+  "next_step": "When the task is done, call this tool again with action='promote' to merge this branch's schema back into 'production', or action='discard' to delete it immediately. Otherwise it self-deletes in 2h."
+}
+```
+**Example call (promote, after the branch's migration ran clean):**
+```json
+{"action": "promote", "organization_id": "acme", "project_id": "store", "environment_id": "agent-7f3a9c21"}
+```
+**Example response:**
+```json
+{
+  "status": "merged", "base_environment_id": "production", "environment_id": "agent-7f3a9c21",
+  "applied": true, "dry_run": false, "clean": true,
+  "changes": [{"object": "public.payments", "action": "added", "statement": "create table public.payments (...);"}],
+  "conflicts": [], "statements": ["create table public.payments (...);"],
+  "fork_base_trusted": true, "fork_base_origin": "fork"
+}
+```
 
 ## Setup
 
@@ -92,11 +203,24 @@ URL, not a secret.
     write/DDL keyword before the statement is sent. Neither layer is
     something this plugin implements — both are enforced by the control
     plane itself.
-- **Long-running behavior:** the tool call itself blocks for up to roughly
-  30 seconds while polling the new environment's provisioning operation. If
-  provisioning is not done by then, it returns a `"status": "provisioning"`
-  result with the operation id instead of blocking indefinitely, so it
-  cannot hang an unattended run (cron, messaging gateway).
+  - `scribase_branch_task` with `action="create"` creates another real,
+    billable environment (a copy-on-write branch), same disclosure as
+    `scribase_create_project` — including that its connection string and
+    API keys are returned into the conversation. `action="promote"` is the
+    only action in this plugin that can change an *existing* environment
+    (the parent): it applies a real schema merge, but only when the control
+    plane's own three-way merge plan is conflict-free, or when `force` is
+    set *and* the organization has no MFA factor (an MFA-protected
+    organization's API key cannot satisfy the step-up challenge a forced
+    merge requires, and the server rejects it outright rather than this
+    plugin silently skipping the check). `action="discard"` permanently
+    deletes the branch and its data.
+- **Long-running behavior:** `scribase_create_project` and
+  `scribase_branch_task` (`create`/`discard`) block for up to roughly 24-30
+  seconds while polling the underlying operation. If it is not done by
+  then, they return a `"status": "provisioning"`/`"discarding"` result
+  with the operation id instead of blocking indefinitely, so neither can
+  hang an unattended run (cron, messaging gateway).
 - **No UI:** this is a pure tool-call plugin. No screens, no Desktop
   surface.
 - **No self-updating code:** the plugin does not fetch or replace its own

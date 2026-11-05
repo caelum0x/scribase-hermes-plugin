@@ -1,12 +1,13 @@
 name: scribase
-version: "1.1.0"
-description: "Provision a hosted Postgres backend project on Scribase (api.scribase.com), lint a SQL migration for real safety issues (missing RLS, unsafe grants/policies) before running it, and run read-only queries against the project's database."
+version: "1.2.0"
+description: "Provision a hosted Postgres backend project on Scribase (api.scribase.com), lint a SQL migration for real safety issues (missing RLS, unsafe grants/policies) before running it, run read-only queries against the project's database, and give an agent a real copy-on-write Postgres branch to create, promote, or discard for one task."
 author: Scribase
 requires_hermes: ">=0.20.1"
 provides_tools:
   - scribase_create_project
   - scribase_lint_migration
   - scribase_query
+  - scribase_branch_task
 requires_env:
   - name: SCRIBASE_API_KEY
     description: "Scribase organization API key. Create one under Organization -> API tokens in the Scribase console, or via POST /v1/organizations/{org}/api-keys."
