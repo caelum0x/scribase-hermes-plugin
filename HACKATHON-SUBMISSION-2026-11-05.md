@@ -4,7 +4,7 @@ Nous Research Hermes Agent Hackathon, $20K pool (1st $10K / 2nd $5K / 3rd $2.5K)
 
 ## What's live
 
-- **Plugin repo (public):** [`caelum0x/scribase-hermes-plugin`](https://github.com/caelum0x/scribase-hermes-plugin), pinned commit `<FILLED IN AFTER COMMIT — see plans/scribase.md for the real SHA>`, version `1.2.0`.
+- **Plugin repo (public):** [`caelum0x/scribase-hermes-plugin`](https://github.com/caelum0x/scribase-hermes-plugin), pinned commit `427a20f712e57e5d351f18aff94fcd06af34e190`, version `1.2.0`.
 - **Catalog admission (original):** [`NousResearch/hermes-agent#149583`](https://github.com/NousResearch/hermes-agent/pull/149583) — **MERGED**, one tool (`scribase_create_project`).
 - **Catalog pin-update PR (open, now updated a 2nd time):** [`NousResearch/hermes-agent#149690`](https://github.com/NousResearch/hermes-agent/pull/149690) — same open PR as the 1.1.0 pin update, pushed again to pin `1.2.0` and add `scribase_branch_task`, per the catalog's normal pin-update re-review flow (still not a new submission).
 - **Demo video:** `HACKATHON-DEMO-2026-11-05.mp4` in this directory (29s, under the 90s cap, silent, no AI-generated visuals — a code-rendered terminal recreation of a real captured transcript from the 1.1.0 build; see "Demo coverage after the branch-task tool" below for what's new and honestly not re-recorded).
