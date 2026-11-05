@@ -1,0 +1,16 @@
+name: scribase
+version: "1.0.0"
+description: "Provision a hosted Postgres backend project on Scribase (api.scribase.com) and get back its connection string and API keys."
+author: Scribase
+requires_hermes: ">=0.20.0"
+provides_tools:
+  - scribase_create_project
+requires_env:
+  - name: SCRIBASE_API_KEY
+    description: "Scribase organization API key. Create one under Organization -> API tokens in the Scribase console, or via POST /v1/organizations/{org}/api-keys."
+    url: "https://docs.scribase.com/docs/api"
+    secret: true
+config_schema:
+  api_base_url:
+    type: str
+    required: false
