@@ -1,13 +1,17 @@
 # Scribase plugin for Hermes Agent
 
-Lets a [Hermes Agent](https://github.com/NousResearch/hermes-agent) provision
-a real hosted Postgres backend on [Scribase](https://scribase.com) — a
+Lets a [Hermes Agent](https://github.com/NousResearch/hermes-agent) run a
+real hosted Postgres backend on [Scribase](https://scribase.com) — a
 Postgres-as-a-service with a Supabase-API-compatible REST/Auth/Storage/
-Realtime/Functions surface — without the user leaving the chat.
+Realtime/Functions surface — without the user leaving the chat: provision a
+project, check a migration for real safety problems before it runs, and
+query the data, all against the live API.
 
 ## What it does
 
-Registers one tool, `scribase_create_project`, that:
+Registers three tools, no hooks, no middleware, no CLI/slash commands:
+
+### `scribase_create_project`
 
 1. Creates (or confirms) a project inside an existing Scribase organization.
 2. Creates the project's first environment (`production` by default).
@@ -18,7 +22,30 @@ Registers one tool, `scribase_create_project`, that:
    (`anon_key`, `service_role_key`, `publishable_key`, `secret_key`,
    `api_url`).
 
-That's it — no other tools, no hooks, no middleware, no CLI/slash commands.
+### `scribase_lint_migration`
+
+Submits a migration's `up` SQL to Scribase's real migration-safety linter —
+the same engine the control plane's migration runner enforces, not a
+generic prompt pattern-matching on text. It parses the SQL into a schema
+model and checks it against real rules: a table created without row level
+security, a `GRANT` to `PUBLIC`, a policy using `USING (true)`, a write
+policy with no `WITH CHECK`, and a `SECURITY DEFINER` function are all
+**block** findings; a foreign key with no supporting index is a **warn**
+finding. The request always sends `"apply": false` — hardcoded in this
+plugin, not read from the model's arguments — so this tool can never run
+the migration, only check it. Returns `{status, safe_to_apply,
+blocking_findings, warning_findings, plan}`.
+
+### `scribase_query`
+
+Runs a single read-only statement (`SELECT`/`WITH`/`TABLE`/`VALUES`/`SHOW`/
+`EXPLAIN`) against a project's database and returns the rows (capped at
+1000, default 100, with the true `row_count` reported so truncation is
+visible). The control plane enforces read-only in two independent layers —
+a static keyword check, then a Postgres `READ ONLY` transaction with a
+bounded statement timeout — so a write or DDL statement, or a
+data-modifying CTE, is rejected by the server itself, not by a check this
+plugin invented.
 
 ## Setup
 
@@ -53,9 +80,18 @@ URL, not a secret.
   `SCRIBASE_API_KEY` exclusively through Hermes's secret scope
   (`agent.secret_scope.get_secret`), never from `os.environ` directly, a
   `.env` file, or any other local store.
-- **Side effects:** calling the tool creates real, billable resources in
-  the user's Scribase organization (a project and a Postgres environment).
-  It does not delete, suspend, or modify anything that already exists.
+- **Side effects:**
+  - `scribase_create_project` creates real, billable resources in the
+    user's Scribase organization (a project and a Postgres environment). It
+    does not delete, suspend, or modify anything that already exists.
+  - `scribase_lint_migration` has no side effects: `apply` is always sent
+    as `false`, so the control plane only ever parses and lints the
+    submitted SQL — it never opens a session against the tenant database.
+  - `scribase_query` only ever runs inside a Postgres `READ ONLY`
+    transaction the server opens; the server also statically rejects any
+    write/DDL keyword before the statement is sent. Neither layer is
+    something this plugin implements — both are enforced by the control
+    plane itself.
 - **Long-running behavior:** the tool call itself blocks for up to roughly
   30 seconds while polling the new environment's provisioning operation. If
   provisioning is not done by then, it returns a `"status": "provisioning"`

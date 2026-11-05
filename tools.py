@@ -8,6 +8,19 @@ string, success or error alike). This module makes network calls only to
 plugin's optional `api_base_url` config key for self-hosted Scribase
 clusters) and uses only the Python standard library — no third-party
 dependencies.
+
+Three tools, three endpoints:
+
+- `create_project` — `PUT .../projects/{id}` + `POST /v1/environments`,
+  provisions real billable resources.
+- `lint_migration` — `POST .../migrations` with `"apply": false` always
+  hardcoded here, so it only ever runs the control plane's migration
+  linter (missing-RLS, unsafe-grant, lock-unsafe-DDL style rules) and never
+  touches the tenant database.
+- `run_query` — `POST .../database/query`, a statement the control plane
+  itself runs inside a Postgres `READ ONLY` transaction; this client does
+  not add its own write guard because the server enforces it twice
+  (lexically, then transactionally).
 """
 
 from __future__ import annotations
@@ -181,3 +194,110 @@ def create_project(args: Dict[str, Any], *, api_key: str, api_base: str) -> Dict
         "secret_key": keys.get("secret_key"),
         "connection_uri": connection_uri,
     }
+
+
+def lint_migration(args: Dict[str, Any], *, api_key: str, api_base: str) -> Dict[str, Any]:
+    """Lint one migration's SQL against Scribase's real migration-safety rules.
+
+    Calls ``POST .../migrations`` with a single ``migration`` entry and
+    ``"apply": false`` (hardcoded here, never read from ``args``) — this is
+    the control plane's own dry-run path: the migration is parsed into a
+    schema model and run through the blocking rules (missing RLS, GRANT to
+    PUBLIC, a permissive `USING (true)` policy, a write policy with no `WITH
+    CHECK`, a `SECURITY DEFINER` function) and the one advisory rule (a
+    foreign key with no supporting index), but nothing ever touches the
+    tenant database — the control plane only opens a database session when
+    ``apply`` is true and the lint is clean, which this call can never
+    request.
+    """
+    org = str(args.get("organization_id") or "").strip()
+    project = str(args.get("project_id") or "").strip()
+    environment = str(args.get("environment_id") or "").strip()
+    up = str(args.get("up") or "").strip()
+    down = args.get("down")
+    name = str(args.get("migration_name") or "").strip() or "hermes_lint_check"
+
+    if not org:
+        return {"error": "organization_id is required."}
+    if not project:
+        return {"error": "project_id is required."}
+    if not environment:
+        return {"error": "environment_id is required."}
+    if not up:
+        return {"error": "up is required (the migration's forward SQL to lint)."}
+
+    migration: Dict[str, Any] = {
+        "version": time.strftime("%Y%m%d%H%M%S", time.gmtime()),
+        "name": name,
+        "up": up,
+    }
+    if down:
+        migration["down"] = str(down)
+
+    status, body = _request(
+        "POST",
+        f"{api_base}/v1/organizations/{org}/projects/{project}/environments/{environment}/migrations",
+        api_key,
+        # "apply" is always False here — this tool only ever lints.
+        body={"migration": migration, "apply": False},
+    )
+    if status == 0:
+        return body
+    if status != 200:
+        return {"error": "migration lint request failed", "status": status, "detail": body}
+
+    findings = body.get("lintFindings", []) if isinstance(body, dict) else []
+    blocking = [f for f in findings if isinstance(f, dict) and f.get("severity") == "BLOCK"]
+    warnings = [f for f in findings if isinstance(f, dict) and f.get("severity") == "WARN"]
+
+    return {
+        "status": "blocked" if blocking else ("warnings" if warnings else "clean"),
+        "safe_to_apply": not blocking,
+        "blocking_findings": blocking,
+        "warning_findings": warnings,
+        "plan": body.get("plan") if isinstance(body, dict) else None,
+    }
+
+
+def run_query(args: Dict[str, Any], *, api_key: str, api_base: str) -> Dict[str, Any]:
+    """Run one read-only statement via ``POST .../database/query``.
+
+    The control plane itself enforces read-only in two independent layers
+    (a static keyword check, then a Postgres `READ ONLY` transaction with a
+    bounded statement timeout), so this client adds no SQL-shape validation
+    of its own — any write/DDL statement is rejected by the server, not
+    silently reinterpreted here.
+    """
+    org = str(args.get("organization_id") or "").strip()
+    project = str(args.get("project_id") or "").strip()
+    environment = str(args.get("environment_id") or "").strip()
+    query = str(args.get("query") or "").strip()
+
+    if not org:
+        return {"error": "organization_id is required."}
+    if not project:
+        return {"error": "project_id is required."}
+    if not environment:
+        return {"error": "environment_id is required."}
+    if not query:
+        return {"error": "query is required (a single read-only SQL statement)."}
+
+    body: Dict[str, Any] = {"query": query}
+    limit = args.get("limit")
+    if limit is not None:
+        try:
+            body["limit"] = int(limit)
+        except (TypeError, ValueError):
+            return {"error": "limit must be an integer between 1 and 1000."}
+
+    status, result = _request(
+        "POST",
+        f"{api_base}/v1/organizations/{org}/projects/{project}/environments/{environment}/database/query",
+        api_key,
+        body=body,
+    )
+    if status == 0:
+        return result
+    if status != 200:
+        return {"error": "query failed", "status": status, "detail": result}
+    return result
