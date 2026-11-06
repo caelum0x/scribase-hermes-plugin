@@ -2,6 +2,118 @@
 
 Nous Research Hermes Agent Hackathon, $20K pool (1st $10K / 2nd $5K / 3rd $2.5K), deadline 2026-11-11.
 
+## 2026-11-06 (later): `scribase_memory_task` — real persistent agent memory, 4 tools → 5
+
+Added a 5th tool, `scribase_memory_task`, to directly fill a real gap: none
+of the first four tools could write application data. `scribase_query` is
+read-only by server-side design (a static keyword check, then a Postgres
+`READ ONLY` transaction) and `scribase_lint_migration` hardcodes
+`apply: false` on purpose — so a Hermes agent using only the 1.2.1 toolset
+could provision a project, branch it, lint SQL, and read rows, but never
+actually store anything in it through this plugin's own tools.
+
+**Found the real write-capable route first, did not guess it.** Read
+`crates/control-api/src/http/database_editor.rs` and
+`crates/control-api/src/adapters/sql_execute.rs` in the main `scribase`
+monorepo checkout: `POST .../database/execute` is the write-mode sibling of
+`database/query` — the same route the Scribase Studio SQL editor's "write
+mode" calls, running a whole script in one transaction, gated to writer
+roles, with its own destructive-statement confirmation step
+(`confirmation_required` + `confirm: true`) independent of anything this
+plugin adds.
+
+**Built `memory_task(action="store"|"recall"|"search"|"forget")`**: `store`
+and `forget` call `database/execute`; `recall` and `search` reuse the
+existing read-only `database/query` route `run_query` already calls. A
+dedicated table, `public.hermes_agent_memories` (RLS enabled, a
+`(scope, created_at desc)` index), is created idempotently the first time
+`store` runs in a project — no setup step for the user. An optional `scope`
+string namespaces memories per end-user/conversation. Every value this
+tool places into SQL (`content`, `metadata`, `scope`, `memory_id`) goes
+through a new `_sql_literal()` helper (the standard Postgres
+string-literal escape — doubled single quotes) before it is interpolated;
+the model is never given a path to pass raw SQL through this tool (that
+remains `scribase_query`'s job, and it stays read-only).
+
+**Verified twice, not once.** First, a throwaway monkeypatched test (not
+committed) drove all 4 actions plus error paths plus one deliberately
+hostile `content` string (`robert'); drop table hermes_agent_memories;--`)
+through the real `_sql_literal()`/`memory_task()` code — confirmed the
+built `INSERT` statement has balanced quotes and the `drop table` text
+lands entirely inside the escaped literal, never as executable SQL.
+Second, ran the real, unmodified `tools.py` directly (bypassing only
+Hermes's own plugin loader, same disclosed pattern as the 2026-11-06
+earlier session) against a **real, live, no-login temporary Scribase
+project on production** `api.scribase.com`:
+
+```
+POST /v1/temporary-projects/challenge -> real 20-bit PoW challenge, solved locally
+POST /v1/temporary-projects (challenge+nonce)
+  -> 201, org "tmp-d5f31a64d19e60183be80c74", project "hermes-memory-demo",
+     agent_token scoped org:read,project:*:admin,sql:write,migrations:write,...
+  -> polled GET /v1/temporary-projects/{id} to "ready" (3 polls, ~30s)
+
+memory_task(action="store", scope="user-42",
+            content="the user prefers dark mode and terse replies",
+            metadata={"kind": "preference"})
+  -> {"status": "stored", "scope": "user-42",
+      "memory_id": "4a2c5a00-5f0a-43d9-9337-edd894ca4293",
+      "created_at": "2026-11-06T15:08:53.273144+00:00"}
+
+memory_task(action="store", scope="user-42",
+            content="owner goal: ship the Hermes hackathon plugin by Nov 11 2026")
+  -> {"status": "stored", "scope": "user-42",
+      "memory_id": "d26ecc4e-367d-43e9-9361-1b2f954118cd", ...}
+
+memory_task(action="recall", scope="user-42")
+  -> {"status": "ok", "scope": "user-42", "row_count": 2, "truncated": false,
+      "memories": [ {owner-goal memory}, {dark-mode memory} ]}   # newest first
+
+memory_task(action="search", scope="user-42", query="hackathon")
+  -> {"status": "ok", "scope": "user-42", "row_count": 1,
+      "memories": [ {owner-goal memory only} ]}
+
+memory_task(action="recall", scope="some-other-scope-nobody-used")
+  -> {"status": "ok", "scope": "some-other-scope-nobody-used",
+      "memories": [], "row_count": 0}        # real scope isolation, not simulated
+
+memory_task(action="forget", scope="user-42",
+            memory_id="4a2c5a00-5f0a-43d9-9337-edd894ca4293")
+  -> {"status": "forgotten", "scope": "user-42", "memory_id": "4a2c5a00-..."}
+
+memory_task(action="recall", scope="user-42")
+  -> {"status": "ok", "scope": "user-42", "row_count": 1,
+      "memories": [ {owner-goal memory only — the forgotten one is gone, the other survives} ]}
+```
+
+Every response above is captured verbatim from the real HTTP calls (only
+the long key/token values are elided; the full real ones were used, never
+placeholders). The underlying `database/execute` call that created the
+table and the two `insert into ... returning id, created_at` calls, and
+the two `database/query` calls for recall/search, are the literal requests
+`tools.py` builds — nothing here was hand-typed JSON.
+
+**Re-validated**: fresh `NousResearch/hermes-agent` clone (the prior
+session's research clone was gone, same clean-worktrees pattern as every
+earlier pass — re-cloned), fresh throwaway venv, `validate_plugin_dir()`
+called directly: **15/15 checks pass, 0 warnings, isolation
+`host_ready: true`**, declared tools matches registrations (now 5:
+`scribase_create_project`, `scribase_lint_migration`, `scribase_query`,
+`scribase_branch_task`, `scribase_memory_task`).
+
+Commit `07a54eb` on `caelum0x/scribase-hermes-plugin` `main`, pushed.
+`plugin.yaml` bumped to `1.3.0`. Catalog pin PR `#149690` (still open, not
+yet maintainer-merged) updated in the same pass — see below.
+
+**Honestly not shown**: a live authenticated Hermes LLM tool-calling loop
+invoking `scribase_memory_task` (same two pre-existing, disclosed
+constraints as every prior entry in this file — this box's Hermes CLI
+predates the plugin system, and a real Scribase *organization* account
+login is owner-gated here). What's shown instead is the literal shipped
+client code run directly against a real production project with a real
+agent-scoped token — the same honest substitution this file's every prior
+entry already uses, just for this new tool.
+
 ## 2026-11-06 update: a real end-to-end session, and 2 real bugs found + fixed in production
 
 Every prior pass below was honest that the biggest remaining gap was a demo built from pieces (compiled-engine runs, public anonymous endpoints, an admission validator) rather than one real Hermes session actually calling these tools. This pass closes as much of that gap as this box genuinely allows, and is equally honest about the part that still doesn't close here.
@@ -124,20 +236,32 @@ Every line of text in the video is a **real, captured output** from a command ac
 
 **Plugin name:** Scribase
 
-**Catalog PR link(s):** https://github.com/NousResearch/hermes-agent/pull/149583 (merged, original admission) and https://github.com/NousResearch/hermes-agent/pull/149690 (open, now updated to v1.2.0 with `scribase_branch_task`)
+**Catalog PR link(s):** https://github.com/NousResearch/hermes-agent/pull/149583 (merged, original admission) and https://github.com/NousResearch/hermes-agent/pull/149690 (open, now updated to v1.3.0 with `scribase_memory_task`)
 
 **Plugin repo:** https://github.com/caelum0x/scribase-hermes-plugin
 
 **Demo video (X post link):** _pending — owner needs to post the video above to X tagging @NousResearch, then paste that tweet URL here_
 
-**One-line description:** Provision a hosted Postgres backend, lint a SQL migration against real safety rules before it runs, run read-only queries, and spin up a real copy-on-write branch to create/promote/discard for one task — all from inside a Hermes agent session.
+**One-line description:** Provision a hosted Postgres backend, lint a SQL migration against real safety rules before it runs, run read-only queries, spin up a real copy-on-write branch to create/promote/discard for one task, and give the agent real persistent memory (store/recall/search/forget) — all from inside a Hermes agent session.
 
-**What makes this more than a prompt or skill?** Two things, both backed by real infrastructure rather than wording. `scribase_lint_migration` calls a real, compiled migration-safety engine that parses SQL into a schema model and checks it against actual Postgres RLS/lock semantics (missing row-level security, unsafe grants, permissive policies, `SECURITY DEFINER` functions, missing FK indexes) — the exact same engine Scribase's own production control plane uses to block unsafe migrations before they run. `scribase_branch_task` gives the agent a disposable, real copy-on-write Postgres branch per task: create it, do the risky thing against it, then either three-way merge its schema back or throw it away — a workflow that needs an actual forked database and an actual schema merge the control plane plans and can refuse on conflict, not something a prompt or skill can simulate. `scribase_query` is backed by a server that enforces read-only in two independent layers (a static check, then an actual Postgres `READ ONLY` transaction) rather than trusting the model's output.
+**What makes this more than a prompt or skill?** Three things, all backed by real infrastructure rather than wording. `scribase_lint_migration` calls a real, compiled migration-safety engine that parses SQL into a schema model and checks it against actual Postgres RLS/lock semantics (missing row-level security, unsafe grants, permissive policies, `SECURITY DEFINER` functions, missing FK indexes) — the exact same engine Scribase's own production control plane uses to block unsafe migrations before they run. `scribase_branch_task` gives the agent a disposable, real copy-on-write Postgres branch per task: create it, do the risky thing against it, then either three-way merge its schema back or throw it away — a workflow that needs an actual forked database and an actual schema merge the control plane plans and can refuse on conflict, not something a prompt or skill can simulate. `scribase_memory_task` gives the agent real memory that survives across sessions — a Postgres row in the user's own project, not the model's context window — store/recall/search/forget, scoped per user/conversation, verified live end to end against production. `scribase_query` is backed by a server that enforces read-only in two independent layers (a static check, then an actual Postgres `READ ONLY` transaction) rather than trusting the model's output.
 
 **Team / maintainer:** caelum0x
 
+### Updated draft X post (v1.3.0 — covers the memory tool; use this one instead of the earlier drafts if not yet posted)
+
+> Shipped v1.3.0 of our Hermes Agent plugin: `scribase_memory_task`.
+>
+> Real persistent memory for your agent — not the context window, an actual Postgres row in your own Scribase project. store / recall / search / forget, scoped per user or conversation. Creates its own table on first use.
+>
+> Plus: provision a project, lint a migration before it runs, run read-only queries, and fork a real copy-on-write branch per task.
+>
+> 5 tools, open source, MIT: github.com/caelum0x/scribase-hermes-plugin
+>
+> @NousResearch #HermesAgent
+
 ## Owner-only remaining steps (silently tracked, not blocking other work)
 
-- Post the demo video to X, tagging @NousResearch (no X account configured in this environment).
+- Post the demo video to X, tagging @NousResearch (no X account configured in this environment). Use the v1.3.0 draft above (covers the memory tool) if posting for the first time; the earlier drafts further up this file are now superseded.
 - Paste that tweet's URL into the submission form and submit (owner login required; no credentials in this environment).
 - Watch `hermes-agent#149690` for maintainer review/merge before the 2026-11-11 deadline — this is a maintainer-review gate, not something to push on from here.
