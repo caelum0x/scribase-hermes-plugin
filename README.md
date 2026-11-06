@@ -175,10 +175,17 @@ Studio SQL editor itself uses in "write mode" (confirmed against the
 compiled control plane's source, `adapters/sql_execute.rs`), not the
 read-only `database/query` route `scribase_query` and `recall`/`search`
 use. Every value this tool interpolates into SQL — `content`, `metadata`,
-`scope`, `memory_id` — is escaped with the standard Postgres
-string-literal escape (doubled single quotes) before it is ever placed in
-a statement; the model never gets to pass raw SQL through this tool (that
-is what `scribase_query` is for, and it is read-only).
+`scope`, `memory_id` — is encoded as a hex-decoded expression
+(`convert_from(decode('<hex>','hex'),'UTF8')`) before it is ever placed in
+a statement, not a quoted-and-escaped literal: a hex literal can only ever
+contain `0-9a-f`, so it can never contain a quote, backslash, or comment
+sequence, which is both injection-safe and avoids a real bug the original
+doubled-single-quote escape had (it tripped the control plane's own
+backslash guard on ordinary non-adversarial content, like metadata with a
+non-ASCII character). Independently re-verified 2026-11-06 with a live
+adversarial payload battery against a real temporary Scribase project —
+no injection found; the model never gets to pass raw SQL through this tool
+(that is what `scribase_query` is for, and it is read-only).
 
 **Example call (store):**
 ```json
