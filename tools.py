@@ -39,10 +39,13 @@ Four tools, four endpoints:
   All SQL this function sends is built by this module, never passed
   through from the model's arguments as raw SQL (that's what `run_query`
   is for) — only `content`/`metadata`/`scope`/`memory_id` string values are
-  interpolated, and every one is escaped with `_sql_literal()` (doubled
-  single quotes, the standard Postgres string-literal escape used when no
-  parameterized-query transport is available) before it is ever placed in
-  a statement.
+  interpolated, and every one goes through `_sql_literal()` first (hex-
+  encoded as `convert_from(decode('<hex>', 'hex'), 'UTF8')`, not a quoted-
+  and-escaped literal — see `_sql_literal()`'s docstring for why: live
+  re-verification found that the classic doubled-single-quote escape,
+  while not itself SQL-injectable, tripped the control plane's own
+  backslash guard on ordinary non-adversarial content such as non-ASCII
+  metadata) before it is ever placed in a statement.
 """
 
 from __future__ import annotations
@@ -665,17 +668,43 @@ _UUID_RE = re.compile(
 
 
 def _sql_literal(value: str) -> str:
-    """Escapes ``value`` as a single-quoted Postgres string literal.
+    """Encodes ``value`` as a Postgres text expression via a hex-encoded
+    ``decode(..., 'hex')``, instead of a classically single-quoted-and-
+    escaped string literal.
 
-    This is the standard escape Postgres itself documents for string
-    literals (double every embedded single quote) — used here because the
-    plain-HTTP `database/execute`/`database/query` routes take one SQL
-    string, not a parameterized query with bind values. NUL bytes are
-    stripped first: Postgres `text` columns can never store one, so passing
-    one through would only ever produce a confusing server-side error.
+    This plugin used to double every embedded single quote (the textbook
+    Postgres string-literal escape) and rely on the server always running
+    these statements with `standard_conforming_strings = on` so a trailing
+    backslash could never swallow the closing quote. That assumption does
+    hold (`control-api/src/adapters/psql.rs` forces it on for every session
+    before any statement runs) — but live re-verification against a real
+    temporary Scribase project (2026-11-06) found a *different*, real,
+    reproducible bug the quote-doubling approach was not defending against
+    at all: the control plane's own client-syntax guard
+    (`client_command_forbidden`, "it has a backslash outside an E'...'
+    string or a dollar-quoted body") rejects the entire statement outright
+    whenever the built literal contains a literal backslash character —
+    which it will for *any* ordinary, non-adversarial content: `content`
+    with a literal backslash (a Windows path, a regex), or any `metadata`
+    value with a non-ASCII character (Python's json.dumps default
+    ensure_ascii escapes those as a backslash-u-XXXX sequence) or an
+    embedded double quote (escaped as a backslash-double-quote pair).
+    Confirmed live: a `store` call with a metadata value containing
+    non-English text (accented Latin, Turkish, Japanese) 400'd every
+    time under the old quote-doubling helper — a real reliability gap
+    for ordinary non-English content, not just an adversarial one.
+
+    A hex-encoded `decode()` call sidesteps the whole class of problem: the
+    literal it builds can only ever contain the ASCII digits/letters
+    `0-9a-f` inside a plain single-quoted string with no embedded quote,
+    backslash, or comment sequence possible, so it can never trip the
+    backslash guard and never depends on `standard_conforming_strings`
+    either way. NUL bytes are stripped first (Postgres `text` can never
+    store one).
     """
     cleaned = value.replace("\x00", "")
-    return "'" + cleaned.replace("'", "''") + "'"
+    hex_value = cleaned.encode("utf-8").hex()
+    return f"convert_from(decode('{hex_value}', 'hex'), 'UTF8')"
 
 
 def _ensure_memory_table(organization_id: str, project_id: str, environment_id: str, *, api_key: str, api_base: str):
