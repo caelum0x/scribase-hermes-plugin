@@ -264,3 +264,100 @@ SCRIBASE_QUERY = {
         "required": ["organization_id", "project_id", "environment_id", "query"],
     },
 }
+
+
+SCRIBASE_MEMORY_TASK = {
+    "name": "scribase_memory_task",
+    "description": (
+        "Give the agent real, persistent memory backed by a Postgres table "
+        "in its own Scribase project — not the model's context window, a "
+        "row that is still there in the next session, next week, on a "
+        "different machine. action='store' saves one memory (free-text "
+        "content plus an optional JSON metadata object) under a scope (an "
+        "optional namespace — use one scope per end user or per "
+        "conversation if more than one needs separate memories in the same "
+        "project; defaults to 'default'). action='recall' lists the most "
+        "recent memories in a scope, newest first. action='search' does the "
+        "same but filtered to memories whose content contains a substring "
+        "(case-insensitive). action='forget' deletes exactly one memory by "
+        "the id a prior store returned — there is no 'forget everything' "
+        "action, so one bad call can never wipe a whole scope. The backing "
+        "table is created automatically (with row-level security enabled) "
+        "the first time this is called with action='store' in a project; "
+        "nothing needs to be set up by hand first. Requires an existing "
+        "Scribase organization and project, and an organization API key "
+        "configured as SCRIBASE_API_KEY."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["store", "recall", "search", "forget"],
+                "description": (
+                    "'store' saves a new memory. 'recall' lists the most "
+                    "recent memories in a scope. 'search' filters by a "
+                    "content substring. 'forget' deletes one memory by id."
+                ),
+            },
+            "organization_id": {
+                "type": "string",
+                "description": "The Scribase organization the project belongs to.",
+            },
+            "project_id": {
+                "type": "string",
+                "description": "The existing Scribase project to store memories in.",
+            },
+            "environment_id": {
+                "type": "string",
+                "description": "The environment to store memories in. Defaults to 'production'.",
+            },
+            "scope": {
+                "type": "string",
+                "description": (
+                    "An optional namespace so more than one agent/user/"
+                    "conversation can keep separate memories in the same "
+                    "project without reading each other's. Defaults to "
+                    "'default'. Max 128 characters."
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": (
+                    "Only used by action='store'. The memory's free text, "
+                    "up to 8192 characters."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Only used by action='store'. An optional JSON object "
+                    "of structured fields alongside the free text (e.g. "
+                    "{\"kind\": \"preference\"})."
+                ),
+            },
+            "memory_id": {
+                "type": "string",
+                "description": (
+                    "Only used by action='forget'. The UUID a prior "
+                    "action='store' call returned."
+                ),
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Only used by action='search'. A case-insensitive "
+                    "substring to match against stored memories' content."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Only used by action='recall'/'search'. Max memories to "
+                    "return, 1-200. Defaults to 20."
+                ),
+            },
+        },
+        "required": ["action", "organization_id", "project_id"],
+    },
+}

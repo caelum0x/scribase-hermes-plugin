@@ -27,11 +27,28 @@ Four tools, four endpoints:
   either promote (merge its schema back) or discard (delete it), never
   touching the parent environment except through an explicit, auditable
   merge.
+- `memory_task` — `POST .../database/execute` (write-mode SQL, confirmed
+  live against a real throwaway project: this is the write-capable sibling
+  of `database/query` the Scribase Studio SQL editor uses in "write mode",
+  gated to writer-scoped callers, see `crates/control-api/src/http/
+  database_editor.rs` and `adapters/sql_execute.rs`) for `store`/`forget`,
+  and `POST .../database/query` (the same read-only route `run_query`
+  calls) for `recall`/`search`: gives a Hermes agent a real, persistent,
+  Postgres-backed memory store — not a prompt's own context window, a real
+  table in the user's own Scribase project that survives across sessions.
+  All SQL this function sends is built by this module, never passed
+  through from the model's arguments as raw SQL (that's what `run_query`
+  is for) — only `content`/`metadata`/`scope`/`memory_id` string values are
+  interpolated, and every one is escaped with `_sql_literal()` (doubled
+  single quotes, the standard Postgres string-literal escape used when no
+  parameterized-query transport is available) before it is ever placed in
+  a statement.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -624,4 +641,227 @@ def _branch_discard(
             f"Branch discard failed (state={final_state!r})."
         ),
         "operation": last_op_body,
+    }
+
+
+# --- memory_task -----------------------------------------------------------
+#
+# Backs a Hermes agent's persistent memory with one dedicated table per
+# project, `public.hermes_agent_memories`, created on first use and reused
+# after that (idempotent — every DDL statement below is written so a second
+# call never errors). `scope` lets more than one agent/user share a project
+# without reading each other's memories (e.g. one scope per end user or per
+# conversation); it defaults to `"default"` for a single-agent setup.
+
+_MEMORY_TABLE = "public.hermes_agent_memories"
+_MEMORY_SCOPE_MAX_LEN = 128
+_MEMORY_CONTENT_MAX_LEN = 8192
+_VALID_MEMORY_ACTIONS = ("store", "recall", "search", "forget")
+# A Postgres UUID's canonical textual form — validated before any `forget`
+# call builds a `WHERE id = '<memory_id>'` clause from it.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _sql_literal(value: str) -> str:
+    """Escapes ``value`` as a single-quoted Postgres string literal.
+
+    This is the standard escape Postgres itself documents for string
+    literals (double every embedded single quote) — used here because the
+    plain-HTTP `database/execute`/`database/query` routes take one SQL
+    string, not a parameterized query with bind values. NUL bytes are
+    stripped first: Postgres `text` columns can never store one, so passing
+    one through would only ever produce a confusing server-side error.
+    """
+    cleaned = value.replace("\x00", "")
+    return "'" + cleaned.replace("'", "''") + "'"
+
+
+def _ensure_memory_table(organization_id: str, project_id: str, environment_id: str, *, api_key: str, api_base: str):
+    """Idempotent DDL: creates the memory table, its scope index, and its
+    permissive RLS policy if (and only if) they do not already exist. Safe
+    to call on every `memory_task` invocation — every statement here is a
+    no-op on a project that already has them.
+    """
+    ddl = (
+        f"create table if not exists {_MEMORY_TABLE} ("
+        "id uuid primary key default gen_random_uuid(), "
+        "scope text not null default 'default', "
+        "content text not null, "
+        "metadata jsonb not null default '{}'::jsonb, "
+        "created_at timestamptz not null default now()"
+        "); "
+        f"create index if not exists hermes_agent_memories_scope_idx "
+        f"on {_MEMORY_TABLE} (scope, created_at desc); "
+        f"alter table {_MEMORY_TABLE} enable row level security; "
+        "do $hermes_memory_policy$ "
+        "begin "
+        "if not exists ("
+        "  select 1 from pg_policies"
+        "  where schemaname = 'public' and tablename = 'hermes_agent_memories'"
+        "    and policyname = 'hermes_agent_memories_service_all'"
+        ") then "
+        "  create policy hermes_agent_memories_service_all on "
+        f"  {_MEMORY_TABLE} for all using (true) with check (true); "
+        "end if; "
+        "end "
+        "$hermes_memory_policy$;"
+    )
+    status, body = _request(
+        "POST",
+        f"{api_base}/v1/organizations/{organization_id}/projects/{project_id}"
+        f"/environments/{environment_id}/database/execute",
+        api_key,
+        body={"query": ddl},
+    )
+    if status == 0:
+        return body
+    if status != 200:
+        return {"error": "failed to prepare the memory table", "status": status, "detail": body}
+    return None
+
+
+def memory_task(args: Dict[str, Any], *, api_key: str, api_base: str) -> Dict[str, Any]:
+    """Dispatches one of four real, persistent-memory actions, all backed by
+    a real table (`hermes_agent_memories`) in the project's own Postgres
+    database — not anything held in the agent's own context window:
+
+    - ``"store"`` — inserts one memory (`content`, optional `metadata`
+      object, optional `scope`) via the write-mode `database/execute` route
+      and returns its id.
+    - ``"recall"`` — lists the most recent memories in a scope (optional
+      `limit`, default 20, max 200) via the read-only `database/query`
+      route, newest first.
+    - ``"search"`` — same as `recall`, filtered to memories whose content
+      contains `query` (case-insensitive substring match, `ILIKE`).
+    - ``"forget"`` — deletes one memory by `memory_id` (a UUID returned by
+      a prior `store`) via `database/execute`. Deleting by id only — there
+      is no "forget everything in this scope" action, so a single bad call
+      can never wipe a whole scope's memory.
+    """
+    action = str(args.get("action") or "").strip().lower()
+    org = str(args.get("organization_id") or "").strip()
+    project = str(args.get("project_id") or "").strip()
+    environment = str(args.get("environment_id") or "").strip() or _DEFAULT_ENVIRONMENT_ID
+
+    if action not in _VALID_MEMORY_ACTIONS:
+        return {"error": f"action must be one of: {', '.join(_VALID_MEMORY_ACTIONS)}."}
+    if not org:
+        return {"error": "organization_id is required."}
+    if not project:
+        return {"error": "project_id is required."}
+
+    scope = str(args.get("scope") or "default").strip() or "default"
+    if len(scope) > _MEMORY_SCOPE_MAX_LEN:
+        return {"error": f"scope must be at most {_MEMORY_SCOPE_MAX_LEN} characters."}
+
+    if action == "store":
+        content = str(args.get("content") or "").strip()
+        if not content:
+            return {"error": "content is required for action='store'."}
+        if len(content) > _MEMORY_CONTENT_MAX_LEN:
+            return {"error": f"content must be at most {_MEMORY_CONTENT_MAX_LEN} characters."}
+        metadata = args.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            return {"error": "metadata must be a JSON object if provided."}
+        prep_error = _ensure_memory_table(org, project, environment, api_key=api_key, api_base=api_base)
+        if prep_error is not None:
+            return prep_error
+        metadata_json = json.dumps(metadata or {})
+        query = (
+            f"insert into {_MEMORY_TABLE} (scope, content, metadata) values ("
+            f"{_sql_literal(scope)}, {_sql_literal(content)}, "
+            f"{_sql_literal(metadata_json)}::jsonb"
+            ") returning id, created_at;"
+        )
+        status, body = _request(
+            "POST",
+            f"{api_base}/v1/organizations/{org}/projects/{project}/environments/{environment}/database/execute",
+            api_key,
+            body={"query": query},
+        )
+        if status == 0:
+            return body
+        if status != 200 or not isinstance(body, dict):
+            return {"error": "failed to store memory", "status": status, "detail": body}
+        statements = body.get("statements") or []
+        rows = statements[0].get("rows") if statements and isinstance(statements[0], dict) else None
+        row = rows[0] if rows else {}
+        return {
+            "status": "stored",
+            "scope": scope,
+            "memory_id": row.get("id"),
+            "created_at": row.get("created_at"),
+        }
+
+    if action == "forget":
+        memory_id = str(args.get("memory_id") or "").strip()
+        if not memory_id:
+            return {"error": "memory_id is required for action='forget' (the id a prior store returned)."}
+        if not _UUID_RE.match(memory_id):
+            return {"error": "memory_id must be a UUID, as returned by a prior action='store' call."}
+        query = (
+            f"delete from {_MEMORY_TABLE} where id = {_sql_literal(memory_id)} "
+            f"and scope = {_sql_literal(scope)} returning id;"
+        )
+        status, body = _request(
+            "POST",
+            f"{api_base}/v1/organizations/{org}/projects/{project}/environments/{environment}/database/execute",
+            api_key,
+            body={"query": query},
+        )
+        if status == 0:
+            return body
+        if status != 200 or not isinstance(body, dict):
+            return {"error": "failed to forget memory", "status": status, "detail": body}
+        statements = body.get("statements") or []
+        affected = statements[0].get("affected_rows") if statements and isinstance(statements[0], dict) else None
+        rows = statements[0].get("rows") if statements and isinstance(statements[0], dict) else None
+        found = bool(rows) or (isinstance(affected, int) and affected > 0)
+        return {
+            "status": "forgotten" if found else "not_found",
+            "scope": scope,
+            "memory_id": memory_id,
+        }
+
+    # action in ("recall", "search")
+    try:
+        limit = int(args.get("limit") or 20)
+    except (TypeError, ValueError):
+        return {"error": "limit must be an integer between 1 and 200."}
+    limit = max(1, min(limit, 200))
+
+    where = f"scope = {_sql_literal(scope)}"
+    if action == "search":
+        search_text = str(args.get("query") or "").strip()
+        if not search_text:
+            return {"error": "query is required for action='search' (substring to match, case-insensitive)."}
+        where += f" and content ilike {_sql_literal('%' + search_text + '%')}"
+
+    query = (
+        f"select id, content, metadata, created_at from {_MEMORY_TABLE} "
+        f"where {where} order by created_at desc limit {limit};"
+    )
+    status, body = _request(
+        "POST",
+        f"{api_base}/v1/organizations/{org}/projects/{project}/environments/{environment}/database/query",
+        api_key,
+        body={"query": query, "limit": limit},
+    )
+    if status == 0:
+        return body
+    if status == 400 and isinstance(body, dict) and body.get("code") in ("relation_does_not_exist", "undefined_table"):
+        # No memory has ever been stored in this project yet — the table
+        # from `_ensure_memory_table` doesn't exist. Not an error: there is
+        # nothing to recall.
+        return {"status": "ok", "scope": scope, "memories": [], "note": "no memories stored yet"}
+    if status != 200 or not isinstance(body, dict):
+        return {"error": f"failed to {action} memories", "status": status, "detail": body}
+    return {
+        "status": "ok",
+        "scope": scope,
+        "memories": body.get("rows") or [],
+        "row_count": body.get("row_count"),
+        "truncated": body.get("truncated"),
     }

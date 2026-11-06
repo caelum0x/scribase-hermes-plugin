@@ -15,7 +15,7 @@ be linked from once it's live on X.
 
 ## What it does
 
-Registers four tools, no hooks, no middleware, no CLI/slash commands:
+Registers five tools, no hooks, no middleware, no CLI/slash commands:
 
 ### `scribase_create_project`
 
@@ -158,6 +158,56 @@ One tool, three actions:
 }
 ```
 
+### `scribase_memory_task`
+
+Real, persistent memory for the agent — backed by a Postgres table in the
+user's own Scribase project, not the model's own context window. One tool,
+four actions: `store`, `recall`, `search`, `forget`. The backing table
+(`public.hermes_agent_memories`, row-level security enabled) is created
+automatically the first time `store` is called in a project; nothing needs
+to be set up by hand first. An optional `scope` namespaces memories (one
+scope per end user or per conversation) so more than one can share a
+project without reading each other's.
+
+`store`/`forget` are the only two actions that write, and both go through
+`POST .../database/execute` — the real write-mode SQL route the Scribase
+Studio SQL editor itself uses in "write mode" (confirmed against the
+compiled control plane's source, `adapters/sql_execute.rs`), not the
+read-only `database/query` route `scribase_query` and `recall`/`search`
+use. Every value this tool interpolates into SQL — `content`, `metadata`,
+`scope`, `memory_id` — is escaped with the standard Postgres
+string-literal escape (doubled single quotes) before it is ever placed in
+a statement; the model never gets to pass raw SQL through this tool (that
+is what `scribase_query` is for, and it is read-only).
+
+**Example call (store):**
+```json
+{
+  "action": "store", "organization_id": "acme", "project_id": "store",
+  "scope": "user-42", "content": "prefers dark mode and terse replies",
+  "metadata": {"kind": "preference"}
+}
+```
+**Example response:**
+```json
+{"status": "stored", "scope": "user-42", "memory_id": "4a2c5a00-5f0a-43d9-9337-edd894ca4293", "created_at": "2026-11-06T15:08:53.273144+00:00"}
+```
+**Example call (search):**
+```json
+{"action": "search", "organization_id": "acme", "project_id": "store", "scope": "user-42", "query": "dark mode"}
+```
+**Example response:**
+```json
+{"status": "ok", "scope": "user-42", "memories": [{"id": "4a2c5a00-...", "content": "prefers dark mode and terse replies", "metadata": {"kind": "preference"}, "created_at": "2026-11-06T15:08:53.273144+00:00"}], "row_count": 1, "truncated": false}
+```
+
+Verified live end to end against a real, temporary, no-login Scribase
+project on production `api.scribase.com` on 2026-11-06 — store (x2),
+recall, search, scope isolation (a second, never-used scope correctly
+returns zero rows), and forget (deletes exactly the one memory, leaves the
+other) — see `HACKATHON-SUBMISSION-2026-11-05.md`'s 2026-11-06 section for
+the full real request/response transcript.
+
 ## Setup
 
 1. Have a Scribase account and organization (`scribase.com`).
@@ -215,6 +265,14 @@ URL, not a secret.
     merge requires, and the server rejects it outright rather than this
     plugin silently skipping the check). `action="discard"` permanently
     deletes the branch and its data.
+  - `scribase_memory_task` with `action="store"` creates a new table
+    (`hermes_agent_memories`) in the project the first time it is called
+    there, and inserts one row per call thereafter. `action="forget"`
+    deletes exactly one row by id. `action="recall"`/`action="search"` only
+    read. No action in this tool can touch any table other than
+    `hermes_agent_memories`, and `forget` can only ever delete the single
+    row whose id is passed in — there is no action that deletes an entire
+    scope or table.
 - **Long-running behavior:** `scribase_create_project` and
   `scribase_branch_task` (`create`/`discard`) block for up to roughly 24-30
   seconds while polling the underlying operation. If it is not done by

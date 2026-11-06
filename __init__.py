@@ -20,6 +20,11 @@ Registers four tools against Scribase's public REST API
   merge unless `force`, which it also refuses for an MFA-protected
   organization), `discard` deletes it outright. The parent is never touched
   except through that one explicit, server-validated merge.
+- `scribase_memory_task` — real, persistent agent memory backed by a
+  Postgres table in the user's own Scribase project (not the model's
+  context window): `store`/`recall`/`search`/`forget`. Creates its own
+  table (`hermes_agent_memories`, RLS enabled) on first use; every value
+  interpolated into SQL is escaped, never raw model-supplied SQL.
 
 Hermes surfaces used: `ctx.register_tool` only. No hooks, no middleware, no
 CLI/slash commands, no runtime overrides of Hermes internals.
@@ -88,7 +93,7 @@ def _make_handler(
 
 
 def register(ctx) -> None:
-    """Wires all four Scribase tools to the Scribase REST client."""
+    """Wires all five Scribase tools to the Scribase REST client."""
 
     ctx.register_tool(
         name="scribase_create_project",
@@ -116,4 +121,11 @@ def register(ctx) -> None:
         toolset="scribase",
         schema=schemas.SCRIBASE_BRANCH_TASK,
         handler=_make_handler(ctx, "scribase_branch_task", tools.branch_task),
+    )
+
+    ctx.register_tool(
+        name="scribase_memory_task",
+        toolset="scribase",
+        schema=schemas.SCRIBASE_MEMORY_TASK,
+        handler=_make_handler(ctx, "scribase_memory_task", tools.memory_task),
     )
